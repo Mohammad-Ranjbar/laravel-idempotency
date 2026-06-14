@@ -22,7 +22,7 @@ final class PaymentController extends Controller
     public function store(Request $request): JsonResponse
     {
         $data = $request->validate([
-            'amount'   => ['required', 'integer', 'min:1', 'max:1_000_000_00'],
+            'amount'   => ['required', 'integer', 'min:1', 'max:100000000'],
             'currency' => ['required', 'string', 'size:3', Rule::in(['USD', 'EUR', 'GBP'])],
         ]);
 

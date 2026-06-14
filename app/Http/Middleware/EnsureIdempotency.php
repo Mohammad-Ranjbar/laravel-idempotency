@@ -31,30 +31,31 @@ use Symfony\Component\HttpFoundation\Response;
  *        - cache the response (only successful 2xx–4xx by policy).
  *   6. On lock-wait timeout → 503 with Retry-After.
  */
-final class EnsureIdempotency
+final readonly class EnsureIdempotency
 {
     public function __construct(
-        private readonly IdempotencyService $service,
-        private readonly RequestFingerprint $fingerprinter,
-        private readonly ConfigRepository $config,
-        private readonly LoggerInterface $logger,
-    ) {
+        private IdempotencyService $service,
+        private RequestFingerprint $fingerprinter,
+        private ConfigRepository   $config,
+        private LoggerInterface    $logger,
+    )
+    {
     }
 
     public function handle(Request $request, Closure $next): Response
     {
-        if (! $this->isMutating($request)) {
+        if (!$this->isMutating($request)) {
             return $next($request);
         }
 
-        $headerName = (string) $this->config->get('idempotency.header', 'Idempotency-Key');
-        $rawKey     = $request->header($headerName);
+        $headerName = (string)$this->config->get('idempotency.header', 'Idempotency-Key');
+        $rawKey = $request->header($headerName);
 
-        if (! is_string($rawKey) || trim($rawKey) === '') {
+        if (!is_string($rawKey) || trim($rawKey) === '') {
             return $this->problem(
                 400,
                 'idempotency_key_required',
-                "The {$headerName} header is required for ".strtoupper($request->getMethod()).' requests.',
+                "The {$headerName} header is required for " . strtoupper($request->getMethod()) . ' requests.',
             );
         }
 
@@ -65,13 +66,13 @@ final class EnsureIdempotency
         } catch (InvalidIdempotencyKeyException $e) {
             $this->logger->warning('idempotency.invalid_key', [
                 'key_hash' => $this->service->hashForLog($key),
-                'user_id'  => $this->userId($request),
+                'user_id' => $this->userId($request),
             ]);
 
             return $this->problem(400, 'idempotency_key_invalid', $e->getMessage());
         }
 
-        $userId      = $this->userId($request);
+        $userId = $this->userId($request);
         $fingerprint = $this->fingerprinter->for($request);
 
         // Fast path: pre-lock lookup. Avoids spinning the lock for the
@@ -102,20 +103,20 @@ final class EnsureIdempotency
                     // failures stay legitimately retryable, and skip
                     // oversize bodies to bound Redis memory usage.
                     $shouldStore = $this->service->shouldCacheStatus($response->getStatusCode())
-                        && strlen((string) $response->getContent()) <= $this->service->maxBodyBytes();
+                        && strlen((string)$response->getContent()) <= $this->service->maxBodyBytes();
 
-                    if (! $shouldStore) {
+                    if (!$shouldStore) {
                         $this->logger->info('idempotency.bypass_cache', [
-                            'key_hash'  => $this->service->hashForLog($key),
-                            'user_id'   => $userId,
-                            'status'    => $response->getStatusCode(),
-                            'body_size' => strlen((string) $response->getContent()),
+                            'key_hash' => $this->service->hashForLog($key),
+                            'user_id' => $userId,
+                            'status' => $response->getStatusCode(),
+                            'body_size' => strlen((string)$response->getContent()),
                         ]);
                     } else {
                         $this->logger->info('idempotency.stored', [
                             'key_hash' => $this->service->hashForLog($key),
-                            'user_id'  => $userId,
-                            'status'   => $response->getStatusCode(),
+                            'user_id' => $userId,
+                            'status' => $response->getStatusCode(),
                         ]);
                     }
 
@@ -127,70 +128,37 @@ final class EnsureIdempotency
                 503,
                 'idempotency_lock_timeout',
                 'A request with this Idempotency-Key is still in progress. Please retry.',
-                ['Retry-After' => (string) $this->service->lockWait()],
+                ['Retry-After' => (string)$this->service->lockWait()],
             );
         }
-    }
-
-    private function buildRecord(
-        Response $response,
-        string $key,
-        string|int|null $userId,
-        string $fingerprint,
-    ): IdempotencyRecord {
-        $now = time();
-
-        return new IdempotencyRecord(
-            key:          $key,
-            userId:       $userId,
-            fingerprint:  $fingerprint,
-            status:       $response->getStatusCode(),
-            responseBody: (string) $response->getContent(),
-            headers:      $this->safeHeaders($response),
-            createdAt:    $now,
-            expiresAt:    $now + $this->service->ttl(),
-        );
-    }
-
-    private function replayOrConflict(
-        IdempotencyRecord $record,
-        string $fingerprint,
-        string $key,
-        string|int|null $userId,
-    ): Response {
-        // hash_equals — constant-time comparison defends against timing
-        // oracles on the fingerprint (OWASP A02 mitigation).
-        if (! hash_equals($record->fingerprint, $fingerprint)) {
-            $this->logger->warning('idempotency.fingerprint_conflict', [
-                'key_hash' => $this->service->hashForLog($key),
-                'user_id'  => $userId,
-            ]);
-
-            return $this->problem(
-                409,
-                'idempotency_key_conflict',
-                'This Idempotency-Key was previously used with a different request payload.',
-            );
-        }
-
-        $this->logger->info('idempotency.replay', [
-            'key_hash' => $this->service->hashForLog($key),
-            'user_id'  => $userId,
-            'status'   => $record->status,
-        ]);
-
-        $response = new Response($record->responseBody, $record->status, $record->headers);
-        $response->headers->set('Idempotent-Replayed', 'true');
-        $response->headers->set('Idempotency-Key', $key);
-
-        return $response;
     }
 
     private function isMutating(Request $request): bool
     {
-        $methods = (array) $this->config->get('idempotency.methods', ['POST', 'PUT', 'PATCH', 'DELETE']);
+        $methods = (array)$this->config->get('idempotency.methods', ['POST', 'PUT', 'PATCH', 'DELETE']);
 
         return in_array(strtoupper($request->getMethod()), array_map('strtoupper', $methods), true);
+    }
+
+    /**
+     * RFC 7807-style JSON error response, formatted identically for
+     * every failure mode so client SDKs can pattern-match cleanly.
+     *
+     * @param array<string,string> $headers
+     */
+    private function problem(int $status, string $code, string $detail, array $headers = []): JsonResponse
+    {
+        return new JsonResponse(
+            [
+                'error' => [
+                    'code' => $code,
+                    'message' => $detail,
+                    'status' => $status,
+                ],
+            ],
+            $status,
+            $headers,
+        );
     }
 
     private function userId(Request $request): string|int|null
@@ -204,6 +172,62 @@ final class EnsureIdempotency
         return $user->getAuthIdentifier();
     }
 
+    private function replayOrConflict(
+        IdempotencyRecord $record,
+        string            $fingerprint,
+        string            $key,
+        string|int|null   $userId,
+    ): Response
+    {
+        // hash_equals — constant-time comparison defends against timing
+        // oracles on the fingerprint (OWASP A02 mitigation).
+        if (!hash_equals($record->fingerprint, $fingerprint)) {
+            $this->logger->warning('idempotency.fingerprint_conflict', [
+                'key_hash' => $this->service->hashForLog($key),
+                'user_id' => $userId,
+            ]);
+
+            return $this->problem(
+                409,
+                'idempotency_key_conflict',
+                'This Idempotency-Key was previously used with a different request payload.',
+            );
+        }
+
+        $this->logger->info('idempotency.replay', [
+            'key_hash' => $this->service->hashForLog($key),
+            'user_id' => $userId,
+            'status' => $record->status,
+        ]);
+
+        $response = new Response($record->responseBody, $record->status, $record->headers);
+        $response->headers->set('Idempotent-Replayed', 'true');
+        $response->headers->set('Idempotency-Key', $key);
+
+        return $response;
+    }
+
+    private function buildRecord(
+        Response        $response,
+        string          $key,
+        string|int|null $userId,
+        string          $fingerprint,
+    ): IdempotencyRecord
+    {
+        $now = time();
+
+        return new IdempotencyRecord(
+            key: $key,
+            userId: $userId,
+            fingerprint: $fingerprint,
+            status: $response->getStatusCode(),
+            responseBody: (string)$response->getContent(),
+            headers: $this->safeHeaders($response),
+            createdAt: $now,
+            expiresAt: $now + $this->service->ttl(),
+        );
+    }
+
     /**
      * Strip hop-by-hop & framework-managed headers; preserve only what
      * is safe and necessary for the client to parse the replayed body.
@@ -213,7 +237,7 @@ final class EnsureIdempotency
     private function safeHeaders(Response $response): array
     {
         $allow = ['content-type', 'content-language', 'cache-control', 'etag', 'location'];
-        $out   = [];
+        $out = [];
 
         foreach ($allow as $name) {
             $value = $response->headers->get($name);
@@ -223,26 +247,5 @@ final class EnsureIdempotency
         }
 
         return $out;
-    }
-
-    /**
-     * RFC 7807-style JSON error response, formatted identically for
-     * every failure mode so client SDKs can pattern-match cleanly.
-     *
-     * @param  array<string,string>  $headers
-     */
-    private function problem(int $status, string $code, string $detail, array $headers = []): JsonResponse
-    {
-        return new JsonResponse(
-            [
-                'error' => [
-                    'code'    => $code,
-                    'message' => $detail,
-                    'status'  => $status,
-                ],
-            ],
-            $status,
-            $headers,
-        );
     }
 }
