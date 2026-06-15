@@ -69,6 +69,15 @@ final class RequestFingerprint
     }
 
     /**
+     * Recursively normalize structure for a stable canonical form:
+     *   - JSON objects (associative arrays) are key-sorted so member order
+     *     never affects the fingerprint.
+     *   - JSON arrays (list arrays) are left in place — element order is
+     *     semantically significant and MUST be preserved. Sorting them by
+     *     string key would also corrupt the structure for lists of >= 11
+     *     elements ("10" sorts before "2"), silently re-encoding a JSON
+     *     array as a JSON object.
+     *
      * @param  array<array-key,mixed>  $data
      * @return array<array-key,mixed>
      */
@@ -80,7 +89,9 @@ final class RequestFingerprint
             }
         }
 
-        ksort($data, SORT_STRING);
+        if (!array_is_list($data)) {
+            ksort($data, SORT_STRING);
+        }
 
         return $data;
     }

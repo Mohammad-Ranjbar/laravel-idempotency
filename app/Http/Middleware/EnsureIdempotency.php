@@ -6,6 +6,7 @@ namespace App\Http\Middleware;
 
 use App\Services\Idempotency\Exceptions\IdempotencyLockTimeoutException;
 use App\Services\Idempotency\Exceptions\InvalidIdempotencyKeyException;
+use App\Services\Idempotency\Exceptions\MaxIdempotencyKeysException;
 use App\Services\Idempotency\IdempotencyRecord;
 use App\Services\Idempotency\IdempotencyService;
 use App\Services\Idempotency\RequestFingerprint;
@@ -73,12 +74,13 @@ final readonly class EnsureIdempotency
         }
 
         $userId = $this->userId($request);
+        $scope = $this->scope($request);
         $fingerprint = $this->fingerprinter->for($request);
 
         // Fast path: pre-lock lookup. Avoids spinning the lock for the
         // overwhelmingly common "client retried after seeing the original
         // response just fine" case.
-        $existing = $this->service->find($key, $userId);
+        $existing = $this->service->find($key, $scope);
         if ($existing !== null) {
             return $this->replayOrConflict($existing, $fingerprint, $key, $userId);
         }
@@ -86,7 +88,7 @@ final readonly class EnsureIdempotency
         try {
             return $this->service->withLock(
                 $key,
-                $userId,
+                $scope,
                 function (?IdempotencyRecord $existing) use ($next, $request, $key, $userId, $fingerprint): array {
                     // Double-check inside the lock: a peer worker may
                     // have populated the cache while we were blocked.
@@ -130,6 +132,13 @@ final readonly class EnsureIdempotency
                 'A request with this Idempotency-Key is still in progress. Please retry.',
                 ['Retry-After' => (string)$this->service->lockWait()],
             );
+        } catch (MaxIdempotencyKeysException $e) {
+            return $this->problem(
+                429,
+                'idempotency_key_limit_exceeded',
+                $e->getMessage(),
+                ['Retry-After' => (string)$this->service->ttl()],
+            );
         }
     }
 
@@ -163,13 +172,31 @@ final readonly class EnsureIdempotency
 
     private function userId(Request $request): string|int|null
     {
-        $user = $request->user();
+        return $request->user()?->getAuthIdentifier();
+    }
 
-        if ($user === null) {
-            return null;
+    /**
+     * Namespace under which the key + lock + counter are stored.
+     *
+     * Authenticated requests scope to the user id; stateful unauthenticated
+     * requests fall back to the session id so two anonymous clients reusing
+     * the same Idempotency-Key cannot collide (cross-read / false conflict).
+     * Purely stateless anonymous requests collapse to a shared 'anon'
+     * namespace — such callers should always authenticate to get isolation.
+     */
+    private function scope(Request $request): string
+    {
+        $userId = $this->userId($request);
+
+        if ($userId !== null) {
+            return 'u:'.$userId;
         }
 
-        return $user->getAuthIdentifier();
+        if ($request->hasSession() && $request->session()->isStarted()) {
+            return 's:'.$request->session()->getId();
+        }
+
+        return 'anon';
     }
 
     private function replayOrConflict(
