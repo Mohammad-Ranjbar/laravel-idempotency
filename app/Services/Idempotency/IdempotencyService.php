@@ -6,6 +6,7 @@ namespace App\Services\Idempotency;
 
 use App\Services\Idempotency\Exceptions\IdempotencyLockTimeoutException;
 use App\Services\Idempotency\Exceptions\InvalidIdempotencyKeyException;
+use App\Services\Idempotency\Exceptions\MaxIdempotencyKeysException;
 use Closure;
 use Illuminate\Config\Repository as ConfigRepository;
 use Illuminate\Contracts\Cache\Factory as CacheFactory;
@@ -53,13 +54,13 @@ final class IdempotencyService
      */
     public function withLock(
         string $key,
-        string|int|null $userId,
+        string|int|null $scope,
         Closure $critical,
     ): mixed {
         $this->assertValidKey($key);
 
-        $cacheKey = $this->cacheKey($key, $userId);
-        $lockKey  = $this->lockKey($key, $userId);
+        $cacheKey = $this->cacheKey($key, $scope);
+        $lockKey  = $this->lockKey($key, $scope);
         $lock     = $this->cache()->lock($lockKey, $this->lockTtl());
 
         try {
@@ -67,7 +68,7 @@ final class IdempotencyService
         } catch (LockTimeoutException $e) {
             $this->logger->warning('idempotency.lock_timeout', [
                 'key_hash' => $this->hashForLog($key),
-                'user_id'  => $userId,
+                'scope'    => $scope,
             ]);
 
             throw new IdempotencyLockTimeoutException(
@@ -79,10 +80,17 @@ final class IdempotencyService
         try {
             $existing = $this->fetch($cacheKey);
 
+            // Enforce the per-scope key cap for genuinely new keys only,
+            // before the critical section runs any expensive work.
+            if ($existing === null) {
+                $this->assertUnderKeyLimit($scope);
+            }
+
             [$response, $toStore] = $critical($existing);
 
             if ($toStore !== null) {
                 $this->store($cacheKey, $toStore);
+                $this->incrementKeyCount($scope);
             }
 
             return $response;
@@ -96,26 +104,38 @@ final class IdempotencyService
         }
     }
 
-    public function find(string $key, string|int|null $userId): ?IdempotencyRecord
+    public function find(string $key, string|int|null $scope): ?IdempotencyRecord
     {
         $this->assertValidKey($key);
 
-        return $this->fetch($this->cacheKey($key, $userId));
+        return $this->fetch($this->cacheKey($key, $scope));
     }
 
-    public function cacheKey(string $key, string|int|null $userId): string
+    public function cacheKey(string $key, string|int|null $scope): string
     {
         $prefix = (string) $this->config->get('idempotency.prefix', 'idem');
 
-        // user_id is part of the key so an attacker who guesses another
-        // user's idempotency value cannot read or hijack the cached
-        // response (OWASP A01 — Broken Access Control).
-        return sprintf('%s:%s:%s', $prefix, $userId ?? 'anon', $key);
+        // The scope (authenticated user id, else session id) is part of the
+        // key so an attacker who guesses another principal's idempotency
+        // value cannot read or hijack the cached response (OWASP A01 —
+        // Broken Access Control).
+        return sprintf('%s:%s:%s', $prefix, $scope ?? 'anon', $key);
     }
 
-    public function lockKey(string $key, string|int|null $userId): string
+    public function lockKey(string $key, string|int|null $scope): string
     {
-        return $this->cacheKey($key, $userId).':lock';
+        return $this->cacheKey($key, $scope).':lock';
+    }
+
+    /**
+     * Per-scope counter key tracking how many distinct idempotency keys a
+     * principal has registered within the current TTL window.
+     */
+    public function counterKey(string|int|null $scope): string
+    {
+        $prefix = (string) $this->config->get('idempotency.prefix', 'idem');
+
+        return sprintf('%s:count:%s', $prefix, $scope ?? 'anon');
     }
 
     public function ttl(): int
@@ -144,6 +164,64 @@ final class IdempotencyService
     public function maxBodyBytes(): int
     {
         return (int) $this->config->get('idempotency.max_body_bytes', 1_048_576);
+    }
+
+    /**
+     * Maximum distinct idempotency keys a single scope may register within
+     * a TTL window. `<= 0` disables the cap entirely.
+     */
+    public function maxKeysPerUser(): int
+    {
+        return (int) $this->config->get('idempotency.max_keys_per_user', 1_000);
+    }
+
+    /**
+     * Reject a brand-new key once the scope is at or above its cap.
+     *
+     * @throws MaxIdempotencyKeysException
+     */
+    public function assertUnderKeyLimit(string|int|null $scope): void
+    {
+        $max = $this->maxKeysPerUser();
+
+        if ($max <= 0) {
+            return;
+        }
+
+        $count = (int) ($this->cache()->get($this->counterKey($scope)) ?? 0);
+
+        if ($count >= $max) {
+            $this->logger->warning('idempotency.key_limit_exceeded', [
+                'scope' => $scope,
+                'count' => $count,
+                'max'   => $max,
+            ]);
+
+            throw new MaxIdempotencyKeysException(
+                'Idempotency key limit reached for this principal. Retry later.',
+            );
+        }
+    }
+
+    /**
+     * Bump the per-scope key counter, (re)applying the TTL so it behaves as
+     * a self-healing fixed window and can never grow unbounded.
+     *
+     * The read-modify-write is intentionally a soft limit: under heavy
+     * concurrency it may over/undercount by a few, which is acceptable for
+     * a coarse memory-safety guard and keeps the implementation portable
+     * across every atomic-lock-capable cache store.
+     */
+    public function incrementKeyCount(string|int|null $scope): void
+    {
+        if ($this->maxKeysPerUser() <= 0) {
+            return;
+        }
+
+        $counterKey = $this->counterKey($scope);
+        $current = (int) ($this->cache()->get($counterKey) ?? 0);
+
+        $this->cache()->put($counterKey, $current + 1, $this->ttl());
     }
 
     public function assertValidKey(string $key): void

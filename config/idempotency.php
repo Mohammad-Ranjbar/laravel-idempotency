@@ -118,6 +118,19 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Max Keys Per Scope (DoS guard)
+    |--------------------------------------------------------------------------
+    |
+    | Maximum number of distinct idempotency keys a single scope (authenticated
+    | user, else session) may register within one TTL window. Exceeding it
+    | returns 429. Bounds Redis memory and blunts a key-flood DoS. Set to 0 to
+    | disable the cap entirely.
+    |
+    */
+    'max_keys_per_user' => (int) env('IDEMPOTENCY_MAX_KEYS_PER_USER', 1_000),
+
+    /*
+    |--------------------------------------------------------------------------
     | Logging Channel (OWASP A09)
     |--------------------------------------------------------------------------
     |
